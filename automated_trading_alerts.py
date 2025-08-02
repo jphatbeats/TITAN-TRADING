@@ -1,558 +1,319 @@
 #!/usr/bin/env python3
 """
-Automated Trading Alerts System
-Reads positions.csv, analyzes trading conditions, and sends Discord alerts every hour
+Automated Trading Alerts - No Pandas Version
+Fixed for Railway deployment without pandas dependency
 """
 
-import pandas as pd
 import json
-import time
 import glob
 import os
+import requests
 from datetime import datetime
 import pytz
-import schedule
-import threading
 
-# We'll integrate with the Discord bot instead of webhooks
+# Discord Configuration
+DISCORD_TOKEN = os.getenv('DISCORD_TOKEN')
+ALPHA_CHANNEL_ID = os.getenv('ALPHA_DISCORD_CHANNEL_ID', '1399790636990857277')
+PORTFOLIO_CHANNEL_ID = os.getenv('PORTFOLIO_DISCORD_CHANNEL_ID', '1399451217372905584')
 
-# Google Sheets NoCode API URL
-GOOGLE_SHEETS_API_URL = "https://v1.nocodeapi.com/computerguy81/google_sheets/QxNdANWVhHvvXSzL"
-
-
-def cleanup_old_files(keep_count=3):
-    """Remove old CSV and JSON files, keeping only the most recent ones"""
+def load_latest_positions():
+    """Load latest positions data without pandas"""
     try:
-        print(f"🧹 Cleaning up old files, keeping {keep_count} most recent...")
-        
-        # Clean up CSV files
-        csv_files = glob.glob("positions_*.csv")
-        if len(csv_files) > keep_count:
-            # Sort by modification time (oldest first)
-            csv_files.sort(key=lambda x: os.path.getmtime(x))
-            files_to_delete = csv_files[:-keep_count]  # Keep last N files
-            
-            for file in files_to_delete:
-                os.remove(file)
-                print(f"🗑️ Deleted old CSV: {file}")
-        
-        # Clean up JSON files
+        # Try JSON files first
         json_files = glob.glob("positions_*.json")
-        if len(json_files) > keep_count:
-            # Sort by modification time (oldest first)
-            json_files.sort(key=lambda x: os.path.getmtime(x))
-            files_to_delete = json_files[:-keep_count]  # Keep last N files
+        if json_files:
+            latest_file = max(json_files, key=lambda x: os.path.getctime(x))
+            print(f"📊 Loading positions from: {latest_file}")
             
-            for file in files_to_delete:
-                os.remove(file)
-                print(f"🗑️ Deleted old JSON: {file}")
-                
-        print(f"✅ Cleanup completed - kept {keep_count} most recent files of each type")
+            with open(latest_file, 'r') as f:
+                positions = json.load(f)
+            
+            print(f"✅ Loaded {len(positions)} positions")
+            return positions
         
-    except Exception as e:
-        print(f"⚠️ Error during cleanup: {e}")
-
-
-def find_latest_positions_csv():
-    """Find the most recent positions CSV file"""
-    try:
+        # Fallback to CSV if no JSON
         csv_files = glob.glob("positions_*.csv")
-        if not csv_files:
-            print("❌ No positions CSV files found")
-            return None
-
-        # Sort by modification time to get the latest
-        latest_file = max(csv_files,
-                          key=lambda x: time.ctime(os.path.getmtime(x)))
-        print(f"📄 Found latest positions file: {latest_file}")
-        return latest_file
-    except Exception as e:
-        print(f"❌ Error finding CSV file: {e}")
-        return None
-
-
-def convert_csv_to_json():
-    """Convert latest positions CSV to JSON format"""
-    try:
-        csv_file = find_latest_positions_csv()
-        if not csv_file:
-            return None
-
-        print(f"📄 Converting {csv_file} to JSON...")
-
-        # Read CSV and convert to JSON
-        df = pd.read_csv(csv_file)
-
-        # Clean and prepare data
-        df = df.fillna(0)  # Replace NaN with 0
-
-        # Convert to JSON format
-        positions_json = df.to_dict('records')
-
-        # Save JSON file
-        json_filename = csv_file.replace('.csv', '.json')
-        with open(json_filename, 'w') as f:
-            json.dump(positions_json, f, indent=2, default=str)
-
-        print(f"✅ Converted to {json_filename}")
-        print(f"📄 JSON file saved with {len(positions_json)} positions")
-        return positions_json
-
-    except Exception as e:
-        print(f"❌ Error converting CSV to JSON: {e}")
-        return None
-
-
-def calculate_simulated_rsi(pnl_percentage):
-    """Calculate simulated RSI based on PnL percentage"""
-    try:
-        pnl = float(pnl_percentage)
-
-        # Simulate RSI based on PnL trends
-        if pnl > 25:
-            return min(85, 50 + (pnl * 1.2))  # Strong uptrend = high RSI
-        elif pnl < -15:
-            return max(15, 50 + (pnl * 1.8))  # Strong downtrend = low RSI
-        else:
-            return 50 + (pnl * 0.6)  # Neutral zone
-
-    except (ValueError, TypeError):
-        return 50  # Neutral RSI if calculation fails
-
-
-def analyze_trading_conditions(positions):
-    """Analyze positions for trading alerts"""
-    alerts = []
-
-    if not positions:
-        print("❌ No positions to analyze")
-        return alerts
-
-    print(f"🔍 Analyzing {len(positions)} positions...")
-
-    for position in positions:
-        try:
-            symbol = position.get('Symbol', '')
-            platform = position.get('Platform', '')
-            pnl_pct = float(position.get('Unrealized PnL %', 0))
-            side = position.get('Side (LONG/SHORT)', '')
-            margin_size = float(position.get('Margin Size ($)', 0))
-            entry_price = float(position.get('Entry Price', 0))
-            mark_price = float(position.get('Mark Price', 0))
-
-            # Skip if symbol is empty
-            if not symbol:
-                continue
-
-            # Calculate simulated RSI
-            rsi = calculate_simulated_rsi(pnl_pct)
-
-            print(f"📊 {symbol}: PnL {pnl_pct:.1f}%, RSI {rsi:.1f}")
-
-            # Condition 1: RSI Overbought (RSI > 72) - Optimized threshold
-            if rsi > 72:
-                alerts.append({
-                    'type':
-                    'overbought',
-                    'symbol':
-                    symbol,
-                    'platform':
-                    platform,
-                    'rsi':
-                    round(rsi, 1),
-                    'pnl':
-                    pnl_pct,
-                    'message':
-                    f"🟥 Alert! ${symbol} RSI is {rsi:.1f}. Consider exiting or trailing stop."
-                })
-
-            # Condition 2: RSI Oversold (RSI < 28) - Optimized threshold
-            elif rsi < 28:
-                alerts.append({
-                    'type':
-                    'oversold',
-                    'symbol':
-                    symbol,
-                    'platform':
-                    platform,
-                    'rsi':
-                    round(rsi, 1),
-                    'pnl':
-                    pnl_pct,
-                    'message':
-                    f"🟩 ${symbol} is oversold at RSI {rsi:.1f}. Clean reversal setup detected."
-                })
-
-            # Condition 3: Unrealized PnL < -8% (Losing trade) - More sensitive threshold
-            if pnl_pct < -8:
-                alerts.append({
-                    'type':
-                    'losing_trade',
-                    'symbol':
-                    symbol,
-                    'platform':
-                    platform,
-                    'pnl':
-                    pnl_pct,
-                    'margin':
-                    margin_size,
-                    'message':
-                    f"🚨 ${symbol} is down {pnl_pct:.1f}%. Capital preservation - review position."
-                })
-
-            # Additional Condition: Large position without stop loss (>$150)
-            sl_set = position.get('SL Set?', '❌')
-            if margin_size > 150 and sl_set == '❌':
-                alerts.append({
-                    'type':
-                    'no_stop_loss',
-                    'symbol':
-                    symbol,
-                    'platform':
-                    platform,
-                    'margin':
-                    margin_size,
-                    'message':
-                    f"🛡️ ${symbol} position (${margin_size:.0f}) needs STOP LOSS for fast rotation!"
-                })
-
-            # Additional Condition: High profit opportunity (>35%) - Let winners run
-            if pnl_pct > 35:
-                alerts.append({
-                    'type':
-                    'high_profit',
-                    'symbol':
-                    symbol,
-                    'platform':
-                    platform,
-                    'pnl':
-                    pnl_pct,
-                    'message':
-                    f"💰 ${symbol} up {pnl_pct:.1f}%! Consider rotating or trailing stops."
-                })
-
-        except Exception as e:
-            print(
-                f"⚠️ Error analyzing position {position.get('Symbol', 'unknown')}: {e}"
-            )
-            continue
-
-    print(f"🎯 Analysis complete. Found {len(alerts)} alerts.")
-    return alerts
-
-
-def send_to_google_sheets():
-    """Send portfolio data to Google Sheets API using simplified format"""
-    try:
-        import pandas as pd
-        import requests
-        import glob
-        import os
-
-        # Find the latest positions CSV
-        csv_files = glob.glob("positions_*.csv")
-        if not csv_files:
-            print("❌ No positions CSV files found for Google Sheets")
-            return False
-
-        latest_file = max(csv_files, key=lambda x: os.path.getmtime(x))
-        print(f"📄 Using {latest_file} for Google Sheets sync")
-
-        # Read and format the data
-        df = pd.read_csv(latest_file)
-
-        # Filter out summary rows
-        df_filtered = df[df['Platform'].notna() & (df['Platform'] != 'PORTFOLIO SUMMARY')]
-
-        if df_filtered.empty:
-            print("⚠️ No trading positions found for Google Sheets")
-            return False
-
-        # Create simplified data format for Google Sheets
-        sheet_data = []
+        if csv_files:
+            latest_file = max(csv_files, key=lambda x: os.path.getctime(x))
+            print(f"📊 Loading positions from CSV: {latest_file}")
+            
+            positions = []
+            import csv
+            with open(latest_file, 'r') as f:
+                reader = csv.DictReader(f)
+                positions = list(reader)
+            
+            # Convert string numbers to floats
+            for pos in positions:
+                for key in ['PnL %', 'PnL $', 'Margin Size ($)', 'Entry Price', 'Mark Price']:
+                    if key in pos and pos[key]:
+                        try:
+                            pos[key] = float(pos[key])
+                        except:
+                            pos[key] = 0.0
+            
+            print(f"✅ Loaded {len(positions)} positions from CSV")
+            return positions
         
-        # Add timestamp header
-        from datetime import datetime
-        import pytz
-        central_tz = pytz.timezone('US/Central')
-        timestamp = datetime.now(central_tz).strftime('%Y-%m-%d %I:%M %p CST')
+        print("❌ No positions files found")
+        return []
         
-        # Headers row
-        headers = ["Symbol", "Platform", "Entry", "Current", "PnL%", "Size$", "Side", "Leverage"]
-        sheet_data.append(headers)
-
-        # Data rows
-        for _, row in df_filtered.iterrows():
-            try:
-                symbol = str(row.get('Symbol', 'N/A')).replace('-USDT', '').replace('USDT', '')
-                platform = str(row.get('Platform', 'N/A'))
-                entry_price = float(row.get('Entry Price', 0))
-                mark_price = float(row.get('Mark Price', 0))
-                pnl_pct = float(row.get('PnL %', 0))
-                margin_size = float(row.get('Margin Size ($)', 0))
-                side = str(row.get('Side (LONG/SHORT)', 'UNKNOWN'))
-                leverage = float(row.get('Leverage', 1))
-
-                data_row = [
-                    symbol,
-                    platform,
-                    f"{entry_price:.6f}" if entry_price > 0 else "0",
-                    f"{mark_price:.6f}" if mark_price > 0 else "0",
-                    f"{pnl_pct:+.1f}%",
-                    f"${margin_size:.0f}",
-                    side,
-                    f"{leverage:.0f}x"
-                ]
-                
-                sheet_data.append(data_row)
-
-            except Exception as e:
-                print(f"⚠️ Error processing {row.get('Symbol', 'unknown')} for sheets: {e}")
-                continue
-
-        # Try different API endpoint format
-        print(f"📤 Sending {len(sheet_data)-1} positions to Google Sheets...")
-        print(f"📋 Data preview: {sheet_data[:2]}")
-
-        # Try the NoCode API with proper format
-        url = "https://v1.nocodeapi.com/computerguy81/google_sheets/QxNdANWVhHvvXSzL?tabId=Sheet1"
-        
-        # Send as raw 2D array (not wrapped in data object)
-        response = requests.post(url, json=sheet_data, timeout=30, headers={
-            'Content-Type': 'application/json'
-        })
-
-        print(f"📋 Response status: {response.status_code}")
-        print(f"📋 Response text: {response.text[:200]}...")
-
-        if response.status_code == 200:
-            print("✅ Google Sheets updated successfully!")
-            return True
-        elif response.status_code == 400:
-            print("❌ Bad request - trying alternative format...")
-            # Try with data wrapper
-            alt_payload = {"data": sheet_data}
-            alt_response = requests.post(url, json=alt_payload, timeout=30)
-            if alt_response.status_code == 200:
-                print("✅ Google Sheets updated with alternative format!")
-                return True
-            else:
-                print(f"❌ Alternative format also failed: {alt_response.status_code} - {alt_response.text}")
-                return False
-        else:
-            print(f"❌ Google Sheets API error: {response.status_code} - {response.text}")
-            return False
-
     except Exception as e:
-        print(f"❌ Error sending to Google Sheets: {e}")
-        import traceback
-        print(f"📋 Full error: {traceback.format_exc()}")
+        print(f"❌ Error loading positions: {e}")
+        return []
+
+def send_discord_message(message, channel_id):
+    """Send message to Discord channel"""
+    if not DISCORD_TOKEN:
+        print("⚠️ Discord token not configured, skipping message")
         return False
-
-
-def prepare_alert_data(alerts):
-    """Prepare alert data for Discord bot integration"""
-    if not alerts:
-        print("✅ No alerts to send - all positions look good!")
-        return None
-
+    
     try:
-        # Create timestamp
-        central_tz = pytz.timezone('US/Central')
-        timestamp = datetime.now(central_tz).strftime('%Y-%m-%d %I:%M %p CST')
-
-        # Group alerts by type for summary
-        alert_types = {}
-        for alert in alerts:
-            alert_type = alert['type']
-            alert_types[alert_type] = alert_types.get(alert_type, 0) + 1
-
-        # Prepare alert data that the Discord bot can use
-        alert_data = {
-            "timestamp": timestamp,
-            "total_alerts": len(alerts),
-            "alert_types": alert_types,
-            "alerts": alerts,
-            "summary_parts": []
+        url = f"https://discord.com/api/v9/channels/{channel_id}/messages"
+        headers = {
+            "Authorization": f"Bot {DISCORD_TOKEN}",
+            "Content-Type": "application/json"
         }
-
-        # Create summary parts
-        if 'overbought' in alert_types:
-            alert_data["summary_parts"].append(f"⚠️ Overbought: {alert_types['overbought']}")
-        if 'oversold' in alert_types:
-            alert_data["summary_parts"].append(f"📉 Oversold: {alert_types['oversold']}")
-        if 'losing_trade' in alert_types:
-            alert_data["summary_parts"].append(f"❗Losing: {alert_types['losing_trade']}")
-        if 'no_stop_loss' in alert_types:
-            alert_data["summary_parts"].append(f"🚨 No SL: {alert_types['no_stop_loss']}")
-        if 'high_profit' in alert_types:
-            alert_data["summary_parts"].append(f"💰 High Profit: {alert_types['high_profit']}")
-        if 'confluence' in alert_types:
-            alert_data["summary_parts"].append(f"📰 News: {alert_types['confluence']}")
-        if 'risk' in alert_types:
-            alert_data["summary_parts"].append(f"🚨 Risk News: {alert_types['risk']}")
-        if 'bullish' in alert_types:
-            alert_data["summary_parts"].append(f"🚀 Bullish News: {alert_types['bullish']}")
-
-        print(f"📋 Prepared {len(alerts)} alerts for Discord bot")
-        return alert_data
-
-    except Exception as e:
-        print(f"❌ Error preparing alert data: {e}")
-        return None
-
-def save_alerts_for_bot(alerts):
-    """Save alerts to a file that the Discord bot can read"""
-    if not alerts:
-        return True
-
-    try:
-        alert_data = prepare_alert_data(alerts)
-        if not alert_data:
+        data = {"content": message}
+        
+        response = requests.post(url, headers=headers, json=data, timeout=10)
+        
+        if response.status_code == 200:
+            print(f"✅ Discord message sent to channel {channel_id}")
+            return True
+        else:
+            print(f"❌ Discord API error: {response.status_code}")
             return False
-
-        # Save to JSON file for bot to read
-        alerts_file = "latest_alerts.json"
-        with open(alerts_file, 'w') as f:
-            json.dump(alert_data, f, indent=2, default=str)
-
-        print(f"✅ Saved {len(alerts)} alerts to {alerts_file} for Discord bot")
-        return True
-
+            
     except Exception as e:
-        print(f"❌ Error saving alerts for bot: {e}")
+        print(f"❌ Error sending Discord message: {e}")
         return False
 
-
-def run_trading_analysis():
-    """Main function to run complete trading analysis"""
-    print("\n" + "=" * 60)
-    print("🤖 AUTOMATED TRADING ANALYSIS STARTING")
-    print(
-        f"🕐 Time: {datetime.now(pytz.timezone('US/Central')).strftime('%Y-%m-%d %I:%M %p CST')}"
-    )
-    print("=" * 60)
-
+def analyze_positions(positions):
+    """Analyze positions for alerts without pandas"""
+    alerts = []
+    
     try:
-        # Step 1: Convert CSV to JSON
-        print("\n📋 Step 1: Converting positions CSV to JSON...")
-        positions = convert_csv_to_json()
-        if not positions:
-            print("❌ No positions data available - skipping analysis")
-            return
-
-        print(f"✅ Loaded {len(positions)} positions for analysis")
-
-        # Step 2: Analyze trading conditions
-        print("\n🔍 Step 2: Analyzing trading conditions...")
-        alerts = analyze_trading_conditions(positions)
-
-        # Step 3: Process alerts for Discord bot
-        print("\n📤 Step 3: Processing alerts...")
-        if alerts:
-            print(f"🚨 Found {len(alerts)} trading alerts!")
-            success = save_alerts_for_bot(alerts)
-            if success:
-                print("✅ Alerts saved for Discord bot")
-            else:
-                print("❌ Failed to save alerts")
-        else:
-            print("✅ No alerts triggered - all positions within normal parameters")
-
-        # Step 4: Google Sheets sync disabled
-        print("\n📊 Step 4: Google Sheets sync disabled by user")
-
-        # Step 5: Generate news alerts
-        print("\n📰 Step 5: Fetching crypto news alerts...")
-        try:
-            from crypto_news_alerts import generate_news_alerts
-            news_alerts = generate_news_alerts()
-            if news_alerts:
-                print(f"📰 Found {len(news_alerts)} news alerts")
-                # Add news alerts to main alerts for Discord
-                alerts.extend(news_alerts)
-            else:
-                print("📰 No relevant news alerts found")
-        except Exception as e:
-            print(f"❌ News alerts error: {e}")
-
-        # Step 6: GitHub upload disabled
-        print("\n📤 Step 6: GitHub upload disabled by user")
-
-        # Step 7: Clean up old files
-        print("\n🧹 Step 7: Cleaning up old files...")
-        cleanup_old_files(keep_count=3)  # Keep 3 most recent files
-
-        print("\n🎯 Trading analysis completed successfully!")
-        print("⏰ Next analysis in 1 hour...")
-
+        for pos in positions:
+            symbol = pos.get('Symbol', 'Unknown')
+            platform = pos.get('Platform', 'Unknown')
+            pnl_percent = pos.get('PnL %', 0)
+            pnl_dollar = pos.get('PnL $', 0)
+            margin = pos.get('Margin Size ($)', 0)
+            
+            # Convert to float if string
+            try:
+                pnl_percent = float(pnl_percent)
+                pnl_dollar = float(pnl_dollar) 
+                margin = float(margin)
+            except:
+                continue
+            
+            # High profit alert
+            if pnl_percent > 50:
+                alerts.append({
+                    'type': 'high_profit',
+                    'symbol': symbol,
+                    'platform': platform,
+                    'pnl': pnl_percent,
+                    'message': f"💰 {symbol} up {pnl_percent:.1f}%! Consider rotating or trailing stops.",
+                    'channel': 'portfolio'
+                })
+            
+            # Losing trade alert
+            elif pnl_percent < -10:
+                alerts.append({
+                    'type': 'losing_trade', 
+                    'symbol': symbol,
+                    'platform': platform,
+                    'pnl': pnl_percent,
+                    'margin': margin,
+                    'message': f"🚨 {symbol} is down {pnl_percent:.1f}%. Capital preservation - review position.",
+                    'channel': 'portfolio'
+                })
+            
+            # Oversold conditions (simulate RSI)
+            if pnl_percent < -15:
+                alerts.append({
+                    'type': 'oversold',
+                    'symbol': symbol,
+                    'platform': platform,
+                    'rsi': 20,  # Simulated RSI based on losses
+                    'pnl': pnl_percent,
+                    'message': f"🟩 {symbol} is oversold at simulated RSI 20. Clean reversal setup detected.",
+                    'channel': 'alpha'
+                })
+            
+            # Overbought conditions (simulate RSI)
+            elif pnl_percent > 80:
+                alerts.append({
+                    'type': 'overbought',
+                    'symbol': symbol,
+                    'platform': platform, 
+                    'rsi': 85,  # Simulated RSI based on gains
+                    'pnl': pnl_percent,
+                    'message': f"🟥 Alert! {symbol} RSI is 85. Consider exiting or trailing stop.",
+                    'channel': 'alpha'
+                })
+            
+            # No stop loss warning for high margin positions
+            sl_set = pos.get('SL Set?', '❌')
+            if sl_set == '❌' and margin > 100:
+                alerts.append({
+                    'type': 'no_stop_loss',
+                    'symbol': symbol,
+                    'platform': platform,
+                    'margin': margin,
+                    'message': f"🛡️ {symbol} position (${margin:.0f}) needs STOP LOSS for fast rotation!",
+                    'channel': 'portfolio'
+                })
+        
+        return alerts
+        
     except Exception as e:
-        print(f"❌ Error in trading analysis: {e}")
+        print(f"❌ Error analyzing positions: {e}")
+        return []
 
-
-def run_scheduler():
-    """Run the scheduler in a separate thread"""
-    while True:
-        schedule.run_pending()
-        time.sleep(1)
-
-
-def main():
-    """Main function with hourly scheduling"""
-    print("🚀 AUTOMATED TRADING ALERTS SYSTEM")
-    print("=" * 50)
-    print("📊 Features (OPTIMIZED THRESHOLDS):")
-    print("  • RSI Analysis (Overbought > 72, Oversold < 28)")
-    print("  • PnL Monitoring (Loss alerts < -8%)")
-    print("  • Risk Management (No SL warnings > $150)")
-    print("  • High Profit Alerts (> +35%)")
-    print("  • Hourly automated analysis")
-    print("=" * 50)
-
-    print("🤖 Trading Alert System integrates with Discord bot")
-    print("📋 Alerts will be saved to JSON file for bot processing")
-
-    # Run initial analysis
-    print("\n🎯 Running initial analysis...")
-    run_trading_analysis()
-
-    # Schedule hourly runs
-    print("\n⏰ Setting up hourly schedule...")
-    schedule.every().hour.do(run_trading_analysis)
-
-    # Start scheduler in background thread
-    scheduler_thread = threading.Thread(target=run_scheduler, daemon=True)
-    scheduler_thread.start()
-
-    print("✅ Scheduler started! Running every hour...")
-    print("🔄 Keep this process running for automated alerts")
-
+def get_crypto_news_summary():
+    """Get crypto news summary - simplified version"""
     try:
-        # Keep main thread alive with simple loop
-        while True:
-            time.sleep(60)  # Check every minute
-
-    except KeyboardInterrupt:
-        print("\n🛑 Trading alerts system stopped by user")
+        # Import crypto news functions if available
+        from crypto_news_alerts import get_breaking_news_optimized
+        
+        news = get_breaking_news_optimized(hours=6, items=20)
+        
+        if news:
+            bullish_count = len([n for n in news if n.get('sentiment') == 'Positive'])
+            bearish_count = len([n for n in news if n.get('sentiment') == 'Negative'])
+            
+            summary = f"📰 News: {len(news)} articles | 📈 Bullish: {bullish_count} | 📉 Bearish: {bearish_count}"
+            
+            # Add top news headline if available
+            if news:
+                top_news = news[0]
+                summary += f"\n🔥 Breaking: {top_news.get('title', '')[:100]}..."
+            
+            return summary
+        
+        return "📰 No recent crypto news available"
+        
     except Exception as e:
-        print(f"\n❌ System error: {e}")
+        print(f"⚠️ Crypto news unavailable: {e}")
+        return "📰 Crypto news module not available"
 
+def generate_portfolio_summary(positions, alerts):
+    """Generate portfolio summary without pandas"""
+    try:
+        total_positions = len(positions)
+        profitable_positions = len([p for p in positions if float(p.get('PnL %', 0)) > 0])
+        losing_positions = len([p for p in positions if float(p.get('PnL %', 0)) < 0])
+        
+        # Calculate total PnL
+        total_pnl = 0
+        for pos in positions:
+            try:
+                pnl = float(pos.get('PnL $', 0))
+                total_pnl += pnl
+            except:
+                continue
+        
+        # Alert breakdown
+        alert_counts = {}
+        for alert in alerts:
+            alert_type = alert.get('type', 'unknown')
+            alert_counts[alert_type] = alert_counts.get(alert_type, 0) + 1
+        
+        # Build summary
+        summary = f"""
+🎯 **PORTFOLIO SUMMARY - {datetime.now(pytz.timezone('US/Central')).strftime('%I:%M %p CST')}**
+
+📊 **Positions:** {total_positions} total | ✅ {profitable_positions} profitable | ❌ {losing_positions} losing
+💰 **Total PnL:** ${total_pnl:,.2f}
+
+🚨 **Alerts ({len(alerts)} total):**"""
+        
+        for alert_type, count in alert_counts.items():
+            emoji = {"oversold": "🟩", "overbought": "🟥", "high_profit": "💰", "losing_trade": "📉", "no_stop_loss": "🛡️"}.get(alert_type, "⚠️")
+            summary += f"\n{emoji} {alert_type.replace('_', ' ').title()}: {count}"
+        
+        return summary
+        
+    except Exception as e:
+        print(f"❌ Error generating portfolio summary: {e}")
+        return "❌ Error generating portfolio summary"
 
 def run_automated_alerts():
-    """Simple function to run alerts once - for scheduled deployment"""
-    print("🚀 Running automated trading alerts...")
-    print("📋 Alerts will be processed by Discord bot integration")
-    
-    # Run the analysis
-    run_trading_analysis()
-    print("✅ Automated alerts completed!")
-
+    """Main function to run automated alerts"""
+    try:
+        print("🚀 Starting automated trading alerts...")
+        current_time = datetime.now(pytz.timezone('US/Central'))
+        print(f"⏰ Time: {current_time.strftime('%Y-%m-%d %I:%M %p CST')}")
+        
+        # Load positions
+        positions = load_latest_positions()
+        if not positions:
+            print("❌ No positions data available")
+            return False
+        
+        # Analyze positions for alerts
+        alerts = analyze_positions(positions)
+        print(f"🔍 Generated {len(alerts)} alerts")
+        
+        # Get crypto news summary
+        news_summary = get_crypto_news_summary()
+        
+        # Generate portfolio summary
+        portfolio_summary = generate_portfolio_summary(positions, alerts)
+        
+        # Send alerts to appropriate channels
+        portfolio_alerts = [a for a in alerts if a.get('channel') == 'portfolio']
+        alpha_alerts = [a for a in alerts if a.get('channel') == 'alpha']
+        
+        # Send portfolio summary + portfolio alerts
+        if portfolio_alerts or True:  # Always send portfolio summary
+            portfolio_message = portfolio_summary
+            if portfolio_alerts:
+                portfolio_message += "\n\n📋 **PORTFOLIO ALERTS:**"
+                for alert in portfolio_alerts[:5]:  # Limit to 5 alerts
+                    portfolio_message += f"\n• {alert['message']}"
+            
+            send_discord_message(portfolio_message, PORTFOLIO_CHANNEL_ID)
+        
+        # Send alpha alerts + news summary
+        if alpha_alerts or True:  # Always send news summary
+            alpha_message = f"🎯 **ALPHA HUNTING UPDATE**\n\n{news_summary}"
+            
+            if alpha_alerts:
+                alpha_message += "\n\n🚀 **ALPHA ALERTS:**"
+                for alert in alpha_alerts[:5]:  # Limit to 5 alerts
+                    alpha_message += f"\n• {alert['message']}"
+            
+            send_discord_message(alpha_message, ALPHA_CHANNEL_ID)
+        
+        # Save alerts to file
+        alerts_data = {
+            'timestamp': current_time.strftime('%Y-%m-%d %I:%M %p CST'),
+            'total_alerts': len(alerts),
+            'alerts': alerts,
+            'portfolio_summary': {
+                'total_positions': len(positions),
+                'profitable_count': len([p for p in positions if float(p.get('PnL %', 0)) > 0]),
+                'losing_count': len([p for p in positions if float(p.get('PnL %', 0)) < 0])
+            }
+        }
+        
+        with open('latest_alerts.json', 'w') as f:
+            json.dump(alerts_data, f, indent=2)
+        
+        print("✅ Automated alerts completed successfully")
+        return True
+        
+    except Exception as e:
+        print(f"❌ Error in automated alerts: {e}")
+        return False
 
 if __name__ == "__main__":
-    import sys
-    
-    # Check if running in automated mode
-    if len(sys.argv) > 1 and sys.argv[1] == '--auto':
-        run_automated_alerts()
-    else:
-        main()
+    # Test the alerts system
+    print("🧪 Testing automated trading alerts...")
+    success = run_automated_alerts()
+    print(f"🎯 Test result: {'✅ Success' if success else '❌ Failed'}")
